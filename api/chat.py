@@ -20,7 +20,6 @@ import re
 import time
 import urllib.request
 from collections import Counter
-from http.server import BaseHTTPRequestHandler
 
 from groq import Groq
 
@@ -200,7 +199,35 @@ def _log(trace: dict) -> None:
         print(json.dumps(trace), flush=True)
 
 
-def _answer(message: str, history: list[dict]) -> dict:
+class _CitationFilter:
+    """Removes [n] citation markers from streamed text. A marker can arrive split
+    across chunks ("[", "3", "]"), so a possible marker, and the space before it,
+    is held back until it either closes or clearly isn't one."""
+
+    MAX_MARKER = 12
+
+    def __init__(self) -> None:
+        self.held = ""
+
+    def feed(self, text: str) -> str:
+        buf = self.held + text
+        cut = len(buf)
+        open_at = buf.rfind("[")
+        if open_at != -1 and "]" not in buf[open_at:] and len(buf) - open_at <= self.MAX_MARKER:
+            cut = open_at
+        while cut > 0 and buf[cut - 1].isspace():
+            cut -= 1
+        self.held = buf[cut:]
+        return CITATION.sub("", buf[:cut])
+
+    def flush(self) -> str:
+        out, self.held = CITATION.sub("", self.held), ""
+        return out
+
+
+def answer_events(message: str, history: list[dict]):
+    """Yields {"type": "delta", "text"} as the reply is written, then one
+    {"type": "done", "booking", "sources", "blocked"}."""
     started = time.monotonic()
     client = Groq()
     trace: dict = {"question": message, "turns": len(history)}
@@ -212,7 +239,9 @@ def _answer(message: str, history: list[dict]) -> dict:
     if score is not None and score >= GUARD_THRESHOLD:
         trace.update(blocked=True, latency_ms=round((time.monotonic() - started) * 1000))
         _log(trace)
-        return {"answer": BLOCKED_REPLY, "booking": False, "sources": [], "blocked": True}
+        yield {"type": "delta", "text": BLOCKED_REPLY}
+        yield {"type": "done", "booking": False, "sources": [], "blocked": True}
+        return
 
     chunks = retrieve(search_query(message, history))
     context = "\n\n".join(f"[{n}] ({c['heading']})\n{c['text']}" for n, c in enumerate(chunks, 1))
@@ -223,45 +252,84 @@ def _answer(message: str, history: list[dict]) -> dict:
         *({"role": m["role"], "content": m["content"]} for m in history),
         {"role": "user", "content": message},
     ]
-    resp = client.chat.completions.create(model=MODEL, messages=messages, tools=TOOLS, max_tokens=1024)
-    reply = resp.choices[0].message
+    stream = client.chat.completions.create(
+        model=MODEL, messages=messages, tools=TOOLS, max_tokens=1024, stream=True
+    )
 
-    # The tool has no result to feed back: calling it is the signal for the
-    # frontend to render the scheduler, so there is no second model call
-    booking = bool(reply.tool_calls)
-    text = reply.content or ("Pick a time that works for you below." if booking else "")
-    answer, sources = _extract_citations(text, chunks)
+    raw, booking, usage, first_token_ms = "", False, None, None
+    citations = _CitationFilter()
+    for part in stream:
+        if getattr(part, "x_groq", None) and getattr(part.x_groq, "usage", None):
+            usage = part.x_groq.usage
+        if not part.choices:
+            continue
+        delta = part.choices[0].delta
+        # The tool has no result to feed back: calling it is the signal for the
+        # frontend to render the scheduler, so there is no second model call
+        if delta.tool_calls:
+            booking = True
+        if delta.content:
+            if first_token_ms is None:
+                first_token_ms = round((time.monotonic() - started) * 1000)
+            raw += delta.content
+            text = citations.feed(delta.content)
+            if text:
+                yield {"type": "delta", "text": text}
 
+    tail = citations.flush()
+    if tail:
+        yield {"type": "delta", "text": tail}
+    if booking and not raw.strip():
+        yield {"type": "delta", "text": "Pick a time that works for you below."}
+
+    _, sources = _extract_citations(raw, chunks)
     trace.update(
         blocked=False,
         retrieved=[c["heading"] for c in chunks],
         cited=sources,
         booking=booking,
-        prompt_tokens=resp.usage.prompt_tokens,
-        completion_tokens=resp.usage.completion_tokens,
+        prompt_tokens=getattr(usage, "prompt_tokens", None),
+        completion_tokens=getattr(usage, "completion_tokens", None),
+        first_token_ms=first_token_ms,
         latency_ms=round((time.monotonic() - started) * 1000),
     )
     _log(trace)
-    return {"answer": answer, "booking": booking, "sources": sources, "blocked": False}
+    yield {"type": "done", "booking": booking, "sources": sources, "blocked": False}
 
 
-class handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length) or "{}")
-        message = body.get("message", "")
-        history = body.get("history", [])
+def _answer(message: str, history: list[dict]) -> dict:
+    """The whole reply at once, built from the same events the site streams, so
+    the eval tests exactly what visitors get."""
+    text, done = "", {}
+    for event in answer_events(message, history):
+        if event["type"] == "delta":
+            text += event["text"]
+        else:
+            done = event
+    return {"answer": text.strip(), "booking": done["booking"], "sources": done["sources"], "blocked": done["blocked"]}
 
-        try:
-            payload = _answer(message, history)
-            status = 200
-        except Exception as exc:  # surface the error to the client instead of a 500 body-less fail
-            payload = {"error": str(exc)}
-            status = 500
 
-        data = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+async def app(scope, receive, send):
+    """Plain ASGI app, which Vercel's Python runtime can stream from. The response
+    is newline-delimited JSON, one event per line."""
+    if scope["type"] != "http":
+        return
+    body = b""
+    while True:
+        msg = await receive()
+        body += msg.get("body", b"")
+        if not msg.get("more_body"):
+            break
+    request = json.loads(body or b"{}")
+
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"content-type", b"application/x-ndjson"), (b"cache-control", b"no-cache")],
+    })
+    try:
+        for event in answer_events(request.get("message", ""), request.get("history", [])):
+            await send({"type": "http.response.body", "body": (json.dumps(event) + "\n").encode(), "more_body": True})
+    except Exception as exc:  # the stream has started, so errors travel as an event
+        await send({"type": "http.response.body", "body": (json.dumps({"type": "error", "error": str(exc)}) + "\n").encode(), "more_body": True})
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
