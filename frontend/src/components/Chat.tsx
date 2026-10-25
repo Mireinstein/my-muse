@@ -26,13 +26,18 @@ export default function Chat() {
     if (!question || busy) return;
     setInput("");
     const history = messages; // prior completed turns, for follow-up context
-    setMessages((m) => [...m, { role: "user", content: question }]);
+    // The empty assistant message fills in as the reply streams
+    setMessages((m) => [...m, { role: "user", content: question }, { role: "assistant", content: "" }]);
     setBusy(true);
+    const updateReply = (change: (reply: ChatMessage) => ChatMessage) =>
+      setMessages((m) => [...m.slice(0, -1), change(m[m.length - 1])]);
     try {
-      const { answer, booking, sources } = await ask(question, history);
-      setMessages((m) => [...m, { role: "assistant", content: answer, booking, sources }]);
+      const { booking, sources } = await ask(question, history, (text) =>
+        updateReply((r) => ({ ...r, content: r.content + text })),
+      );
+      updateReply((r) => ({ ...r, content: r.content.trim(), booking, sources }));
     } catch (e) {
-      setMessages((m) => [...m, { role: "assistant", content: `⚠️ ${String(e)}` }]);
+      updateReply((r) => ({ ...r, content: `${r.content}\n\n⚠️ ${String(e)}`.trim() }));
     } finally {
       setBusy(false);
     }
@@ -59,10 +64,13 @@ export default function Chat() {
             </div>
           </div>
         )}
-        {messages.map((m, i) => (
-          <Message key={i} message={m} />
-        ))}
-        {busy && <div className="pl-1 text-sm text-slate-500">Thinking…</div>}
+        {messages.map((m, i) =>
+          // Hold the empty reply back until its first words arrive
+          m.content ? <Message key={i} message={m} /> : null,
+        )}
+        {busy && !messages[messages.length - 1]?.content && (
+          <div className="pl-1 text-sm text-slate-500">Thinking…</div>
+        )}
         <div ref={bottomRef} />
       </div>
 
