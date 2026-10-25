@@ -172,7 +172,8 @@ TOOLS = [
     }
 ]
 
-CITATION = re.compile(r"\s?\[(\d+(?:\s*,\s*\d+)*)\]")
+# gpt-oss sometimes writes its native 【1】 instead of the [1] the prompt asks for
+CITATION = re.compile(r"\s?[\[【](\d+(?:\s*,\s*\d+)*)[\]】]")
 
 
 def search_query(message: str, history: list[dict]) -> str:
@@ -212,8 +213,9 @@ class _CitationFilter:
     def feed(self, text: str) -> str:
         buf = self.held + text
         cut = len(buf)
-        open_at = buf.rfind("[")
-        if open_at != -1 and "]" not in buf[open_at:] and len(buf) - open_at <= self.MAX_MARKER:
+        open_at = max(buf.rfind("["), buf.rfind("【"))
+        tail = buf[open_at:]
+        if open_at != -1 and "]" not in tail and "】" not in tail and len(buf) - open_at <= self.MAX_MARKER:
             cut = open_at
         while cut > 0 and buf[cut - 1].isspace():
             cut -= 1
