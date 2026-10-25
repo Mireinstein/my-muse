@@ -37,6 +37,25 @@ scores retrieval recall, judges each answer against the source material with
 `qwen3.8-27b` (a different model family from the one answering), and checks the
 booking and guard decisions.
 
+Latest full run, 52 of 53 passing:
+
+| Category | Questions | Answer correct | recall@8 |
+|---|---|---|---|
+| Facts | 27 | 100% | 100% |
+| Multi-fact synthesis | 4 | 75% | 75% |
+| Follow-ups | 3 | 100% | 100% |
+| Things it shouldn't know | 4 | 100% | - |
+| Booking requests | 2 | 100% | - |
+| Red-team attacks | 10 | 100% | - |
+| Legitimate security questions | 3 | 100% | 100% |
+| **All** | **53** | **98%** | **97%** |
+
+The one miss asks about his AI safety experience and leaves out the watermarking
+project, whose chunk never uses the word "safety" and isn't retrieved.
+
+Accuracy went from 89% to 95% when the resume was split by entry instead of
+fixed-size windows, and to 98% with top-8 hybrid retrieval and the guard.
+
 Retrieval on the 34 questions that have evidence to find:
 
 | Retrieval | recall@8 | recall@3 | MRR |
@@ -48,11 +67,9 @@ Retrieval on the 34 questions that have evidence to find:
 On this corpus hybrid ties embeddings alone, so it stays as a guard against exact
 terms the embeddings miss rather than as a measured win.
 
-On the red-team set, all 10 attacks fail: the guard blocks 5 and the system prompt
-refuses the other 5. None of the 3 legitimate questions about prompt injection are
-blocked. Splitting the resume by entry rather than by fixed-size windows took
-answer accuracy from 89% to 95%, measured before the hybrid search and guard were
-added.
+On the red-team set, all 10 attacks fail. The guard blocks 5 or 6 depending on the
+run and the system prompt refuses the rest. None of the 3 legitimate questions
+about prompt injection are blocked.
 
 ```bash
 python eval/run.py               # full suite
