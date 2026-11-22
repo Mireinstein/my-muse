@@ -50,9 +50,6 @@ Latest full run, 52 of 53 passing:
 | Legitimate security questions | 3 | 100% | 100% |
 | **All** | **53** | **98%** | **97%** |
 
-The one miss asks about his AI safety experience and leaves out the watermarking
-project, whose chunk never uses the word "safety" and isn't retrieved.
-
 Accuracy went from 89% to 95% when the resume was split by entry instead of
 fixed-size windows, and to 98% with top-8 hybrid retrieval and the guard.
 
